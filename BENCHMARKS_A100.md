@@ -59,8 +59,8 @@ projector eagerly.
 1. **Householder QR dominates the step.** On the NanoGPT parameter banks, batched QR of
    $Y \in \mathbb{R}^{b\times m\times 210}$ takes **50–61 ms** for the single-GPU shapes and
    **12–15 ms** for the 4-GPU shapes (torch 2.7.1). That is more than the entire full-rank
-   Newton–Schulz orthogonalization it is meant to accelerate. We did not profile the cuSOLVER
-   QR kernels further, so we only report the cost, not its internal cause.
+   Newton–Schulz orthogonalization it is meant to accelerate. §2.1 analyzes where this time
+   goes.
 2. **No graph break was observed.** The original motivation for this work assumed that
    `torch.linalg.qr` forces a graph break under `torch.compile(fullgraph=True)`. We did not
    observe this. `torch._dynamo.explain` on the original projector pipeline reports
@@ -68,6 +68,68 @@ projector eagerly.
    torch 2.11. Compiling the Householder pipeline does not change its latency either: 53.3 ms
    vs. 53.4 ms eager for (40, 768, 768) on torch 2.11. The speedup reported below therefore
    comes from replacing the QR algorithm, not from removing a graph break.
+
+### 2.1 Root cause analysis of `torch.linalg.qr`
+
+Script: `tests/profile_qr_root_cause.py`. Setup: A100-SXM4-40GB, torch 2.7.1+cu126, FP32
+$Y$, default linalg backend (cuSOLVER). The script measures three things:
+
+- **Timing** (10 warm-up and 50 timed iterations, medians):
+  - host time until `torch.linalg.qr` returns;
+  - GPU time between `torch.cuda.Event`s recorded around the call;
+  - wall-clock time including synchronization.
+- **Profiler capture** of one call with `torch.profiler` (CPU and CUDA activities).
+- **Backend comparison** between cuSOLVER and MAGMA.
+
+| | $Y \in \mathbb{R}^{24\times 3072\times 210}$ | $Y \in \mathbb{R}^{40\times 768\times 210}$ |
+| :--- | :--- | :--- |
+| Host time until return | 4.3 ms | 44.0 ms |
+| GPU time (CUDA events) | 60.7 ms | 50.4 ms |
+| Wall-clock incl. sync | 60.8 ms | 50.4 ms |
+| Kernels launched per QR call | 748 (31.2 per matrix) | 1,241 (31.0 per matrix) |
+| Dominant kernel | `geqr2_gmem_domino` ×24, 2.28 ms each | `geqr2_smem_domino_fast` ×40, 1.07 ms each |
+| Share of GPU time in `geqr2` | 91.1% | 86.5% |
+| Sync / D2H copies issued by QR | 0 | 0 |
+| `Command Buffer Full` stalls | none | 34, 33.2 ms total |
+| MAGMA backend (GPU time) | 415.5 ms | 238.4 ms |
+
+1. **GPU-kernel-bound, not host-synchronization-bound.** For both shapes, wall-clock time
+   equals GPU time, and the call issues no blocking runtime API. The only
+   `cudaDeviceSynchronize` calls in the capture also appear in a capture that contains only
+   the script's own `torch.cuda.synchronize()`. For (24, 3072, 210), the host gets control
+   back after 4.3 ms, and the remaining 56 ms is GPU execution.
+
+   For (40, 768, 210), the host is held for 44 ms, but this is launch-queue back-pressure, not
+   synchronization. A single QR call enqueues 1,241 kernels, about 31 per matrix. That fills
+   the CUDA command buffer 34 times, and `cudaLaunchKernel` blocks for 33.2 ms in total
+   waiting for the GPU to drain. The host stall is a consequence of slow GPU execution, not
+   its cause.
+2. **Sequential per-matrix panel factorization.** Although `torch.linalg.qr` accepts a batched
+   input, the cuSOLVER path does not parallelize across the batch. The profile shows one
+   Householder panel-factorization kernel (`geqr2_*`) per matrix (24 and 40 invocations),
+   each surrounded by about 30 small kernels: blocked-reflector setup (`larft`), small SGEMMs,
+   copies, and info checks. All of these run one matrix after another. The `geqr2` kernels
+   alone account for 86–91% of GPU time, and the SGEMM-based trailing updates take only a few
+   percent.
+3. **Hardware under-utilization (estimate).** Counting $\approx 2mn^2 - \tfrac{2}{3}n^3$ flops
+   for `geqrf` plus a comparable amount for forming $Q$ (`orgqr`) gives $\approx 0.5$ GFLOP per
+   $3072\times 210$ matrix. That is executed in $\approx 2.5$ ms, an effective throughput of
+   about 0.2 TFLOP/s, or about 1% of the A100's 19.5 TFLOP/s FP32 peak. This figure is derived
+   from the flop count and the measured time, not from hardware counters.
+
+   CholeskyQR3 avoids the per-matrix panel factorization. Its work consists of batched GEMMs
+   over the whole bank (Gram matrix and application of $L^{-1}$) plus a $210\times 210$
+   Cholesky factorization and triangular inverse per matrix. This reduces QR time from
+   50–61 ms to 3.6–5.5 ms (§5). CholeskyQR3 is not free of overheads either: its remaining
+   time is dominated by FP32 SIMT GEMMs, and at small batch sizes by per-matrix
+   cuSOLVER/cuBLAS launches (§5).
+4. **Backend comparison.** Forcing the MAGMA backend
+   (`torch.backends.cuda.preferred_linalg_library("magma")`) makes the QR 4.7–6.9× slower
+   (415.5 ms and 238.4 ms), and the host is blocked for nearly the entire duration. The
+   slowdown is therefore not specific to cuSOLVER: both Householder QR backends available
+   through PyTorch perform poorly on this tall-skinny batched workload. We did not evaluate
+   dedicated batched Householder implementations outside PyTorch, so this does not establish
+   a limit of the Householder algorithm itself.
 
 ## 3. Method: compiled Shifted CholeskyQR3
 
@@ -215,6 +277,9 @@ python tests/test_cholesky_qr.py
 
 # 2. Micro-benchmark plus dynamo.explain on the real orthogonalize_lowrank.
 python tests/bench_lowrank.py
+
+# 2b. Root cause of the Householder QR cost (§2.1).
+python tests/profile_qr_root_cause.py
 
 # 3. NanoGPT smoke test on a single A100 (run once per QR variant).
 python nanogpt/data/cached_fineweb10B.py 2
