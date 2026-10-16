@@ -369,7 +369,7 @@ def orthogonalize(X: torch.Tensor, coeffs: list,
 
 RANDOMIZED_QR = os.environ.get("RANDOMIZED_QR", "cholesky")
 CHOLQR_SHIFT = float(os.environ.get("CHOLQR_SHIFT", "1e-6"))
-CHOLQR_PASSES = int(os.environ.get("CHOLQR_PASSES", "2"))
+CHOLQR_PASSES = int(os.environ.get("CHOLQR_PASSES", "3"))
 
 def _qr_reduced(Y: torch.Tensor) -> torch.Tensor:
     """Reduced QR in FP32 (batched-safe), cast back to Y's dtype."""
@@ -378,26 +378,34 @@ def _qr_reduced(Y: torch.Tensor) -> torch.Tensor:
 
 
 def _cholesky_qr(Y: torch.Tensor, shift: float = CHOLQR_SHIFT,
-                 passes: int = CHOLQR_PASSES) -> torch.Tensor:
-    """Shifted CholeskyQR for tall-skinny Y (..., m, r), r << m. Compile-friendly.
+                 passes: int = CHOLQR_PASSES, out_dtype=None) -> torch.Tensor:
+    """Shifted CholeskyQR3 (Fukaya et al. 2020; Yamamoto et al. 2015) for tall-skinny
+    Y (..., m, r), r << m. Compile-friendly: no host sync, no graph break.
 
-        G = Y^T Y + s*I,  L = chol(G),  Q = Y L^{-T}
-
-    All in FP32. The shift s = shift * mean(diag(G)) is relative so it is invariant to
-    the (unnormalized) scale of Y, and keeps G positive definite when power
-    iterations make Y numerically rank-deficient. cholesky_ex is used instead of
-    cholesky because the latter checks `info` on the host (sync + graph break).
-    passes=2 (CholeskyQR2) re-orthogonalizes Q, recovering ||Q^T Q - I|| ~ O(u).
+    Each pass, in FP32:
+        Q <- Q D^{-1}           D = diag(column norms)   (scale-invariant, no overflow in G)
+        G = Q^T Q + s I,  L = chol(G),  Q <- Q L^{-T}
+    Pass 1 uses s = shift * tr(G), enough to keep G positive definite when power
+    iterations make Y ill-conditioned (kappa(Y) up to ~1/u); afterwards kappa(Q) is small.
+    Passes 2.. are plain CholeskyQR (CholeskyQR2) with only an O(u) safeguard shift,
+    restoring ||Q^T Q - I||_F to O(u). Column scaling does not change span(Q).
+    cholesky_ex is used instead of cholesky, which checks `info` on the host; if a
+    pass fails (Y exactly rank-deficient, e.g. r > rank(M)), that pass is skipped
+    per matrix via torch.where, so the output stays finite without a sync.
     """
     Q = Y.float()
     r = Q.size(-1)
     eye = torch.eye(r, device=Q.device, dtype=Q.dtype)
-    for _ in range(passes):
+    u = torch.finfo(torch.float32).eps
+    for i in range(passes):
+        Q = Q / Q.norm(dim=-2, keepdim=True).clamp_min(1e-30)
         G = Q.mT @ Q
-        s = shift * G.diagonal(dim1=-2, dim2=-1).mean(dim=-1)[..., None, None] + 1e-30
-        L, _ = torch.linalg.cholesky_ex(G + s * eye)
-        Q = torch.linalg.solve_triangular(L, Q.mT, upper=False).mT
-    return Q.to(Y.dtype)
+        tr = G.diagonal(dim1=-2, dim2=-1).sum(dim=-1)[..., None, None]
+        s = shift * tr if i == 0 else (u / r) * tr
+        L, info = torch.linalg.cholesky_ex(G + (s + 1e-30) * eye)
+        Q_next = torch.linalg.solve_triangular(L, Q.mT, upper=False).mT
+        Q = torch.where((info == 0)[..., None, None], Q_next, Q)
+    return Q.to(Y.dtype if out_dtype is None else out_dtype)
 
 
 def _randomized_project_impl(M: torch.Tensor, k: int, p: int, h: int, qr_fn):

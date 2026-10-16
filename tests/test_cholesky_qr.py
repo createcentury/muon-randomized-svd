@@ -4,7 +4,8 @@ train_gpt.py initializes CUDA/NCCL at import time, so the QR helpers are extract
 its source with `ast` and exec'd here; the test exercises the exact code that trains.
 
 Metrics (same Gaussian sketch Omega for both QR variants):
-  * orthogonality      ||Q^T Q - I||_F
+  * orthogonality      ||Q^T Q - I||_F  of the FP32 CholeskyQR3 factor (hard check: <= 1e-4)
+                       and of the bf16 outputs (rounding-limited at ~1e-2 for both QR variants)
   * subspace distance  ||(I - Q_h Q_h^T) Q_c||_2  (= sin of largest principal angle)
   * alignment          <M, Q Z_q> / ||M||_*      (Assumption 2.1 / Prop. 2.3 quantity),
                        Z_q = polar factor of B = Q^T M  (exact, isolates the QR effect)
@@ -113,7 +114,9 @@ def metrics(M, r, h, seed):
     Pc, _ = torch.linalg.qr(Qc64)
     sub = torch.linalg.matrix_norm(Pc - Ph @ (Ph.mT @ Pc), ord=2).max().item()
     nuc = torch.linalg.matrix_norm(M.double(), ord="nuc")
-    out = {"orth_h": orth(Qh), "orth_c": orth(Qc), "subspace": sub}
+    Qc32 = _cholesky_qr(Y, out_dtype=torch.float32)
+    assert torch.isfinite(Qc32).all(), "CholeskyQR produced non-finite values"
+    out = {"orth_h": orth(Qh), "orth_c": orth(Qc), "orth_c32": orth(Qc32), "subspace": sub}
     for name, zfn in (("polar", polar), ("ns5", ns_quintic)):
         ah = ((M.double() * lowrank_output(M, Qh, tall, zfn)).sum((-2, -1)) / nuc)
         ac = ((M.double() * lowrank_output(M, Qc, tall, zfn)).sum((-2, -1)) / nuc)
@@ -132,7 +135,7 @@ CASES = [
     (768, 768, (4,), 2.0),       # fast decay: Y very ill-conditioned after power iteration
     (3072, 768, (), 3.0),        # extreme decay: sigma_200/sigma_1 ~ 1e-7
 ]
-TOL = {"orth_c": 5e-2, "subspace_by_h": {0: 5e-2, 1: 5e-2, 2: 5e-2}, "align_reldiff": 1e-2}
+TOL = {"orth_c32": 1e-4, "align_reldiff": 1e-2}
 
 
 def main():
@@ -140,7 +143,7 @@ def main():
     r = k + p
     failures = []
     print(f"device={DEVICE} torch={torch.__version__} shift={H['CHOLQR_SHIFT']} passes={H['CHOLQR_PASSES']}")
-    hdr = f"{'shape':>18} {'dec':>4} {'h':>2} | {'orth_HH':>8} {'orth_CQR':>8} | {'subspace':>8} | " \
+    hdr = f"{'shape':>18} {'dec':>4} {'h':>2} | {'orth_HH':>8} {'orth_CQR':>8} {'CQR_fp32':>8} | {'subspace':>8} | " \
           f"{'align_pol H/C':>15} {'rel':>8} | {'align_NS5 H/C':>15} {'rel':>8}"
     print(hdr); print("-" * len(hdr))
     for m, n, batch, decay in CASES:
@@ -148,12 +151,14 @@ def main():
         for h in (0, 1, 2):
             o = metrics(M, r, h, seed=1234 + h)
             shape = "x".join(map(str, (*batch, m, n)))
-            print(f"{shape:>18} {decay:>4} {h:>2} | {o['orth_h']:8.1e} {o['orth_c']:8.1e} | {o['subspace']:8.1e} | "
+            print(f"{shape:>18} {decay:>4} {h:>2} | {o['orth_h']:8.1e} {o['orth_c']:8.1e} {o['orth_c32']:8.1e} | {o['subspace']:8.1e} | "
                   f"{o['align_polar_h']:.4f}/{o['align_polar_c']:.4f} {o['align_polar_reldiff']:8.1e} | "
                   f"{o['align_ns5_h']:.4f}/{o['align_ns5_c']:.4f} {o['align_ns5_reldiff']:8.1e}")
-            # Orthogonality is limited by the bf16 cast of Q (both variants), so compare to Householder.
-            if o["orth_c"] > max(TOL["orth_c"], 2 * o["orth_h"]):
-                failures.append((shape, decay, h, "orth", o["orth_c"]))
+            if o["orth_c32"] > TOL["orth_c32"]:
+                failures.append((shape, decay, h, "orth_fp32", o["orth_c32"]))
+            # bf16 output: orthogonality is limited by the bf16 cast (both variants).
+            if o["orth_c"] > 1.5 * o["orth_h"]:
+                failures.append((shape, decay, h, "orth_bf16", o["orth_c"]))
             # Subspace is only well defined when the r-th singular gap is resolvable in bf16;
             # alignment is the quantity the convergence theory needs, so it is the hard check.
             for z in ("polar", "ns5"):
