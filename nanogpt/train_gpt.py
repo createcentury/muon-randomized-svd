@@ -384,7 +384,7 @@ def _cholesky_qr(Y: torch.Tensor, shift: float = CHOLQR_SHIFT,
 
     Each pass, in FP32:
         Q <- Q D^{-1}           D = diag(column norms)   (scale-invariant, no overflow in G)
-        G = Q^T Q + s I,  L = chol(G),  Q <- Q L^{-T}
+        G = Q^T Q + s I,  L = chol(G),  Q <- Q L^{-T}   (L^{-1} formed explicitly, r x r)
     Pass 1 uses s = shift * tr(G), enough to keep G positive definite when power
     iterations make Y ill-conditioned (kappa(Y) up to ~1/u); afterwards kappa(Q) is small.
     Passes 2.. are plain CholeskyQR (CholeskyQR2) with only an O(u) safeguard shift,
@@ -403,7 +403,9 @@ def _cholesky_qr(Y: torch.Tensor, shift: float = CHOLQR_SHIFT,
         tr = G.diagonal(dim1=-2, dim2=-1).sum(dim=-1)[..., None, None]
         s = shift * tr if i == 0 else (u / r) * tr
         L, info = torch.linalg.cholesky_ex(G + (s + 1e-30) * eye)
-        Q_next = torch.linalg.solve_triangular(L, Q.mT, upper=False).mT
+        # L is only r x r: invert it, then apply as one GEMM (a trsm over m rows is slow).
+        L_inv = torch.linalg.solve_triangular(L, eye.expand_as(L), upper=False)
+        Q_next = Q @ L_inv.mT
         Q = torch.where((info == 0)[..., None, None], Q_next, Q)
     return Q.to(Y.dtype if out_dtype is None else out_dtype)
 
