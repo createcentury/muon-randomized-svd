@@ -363,7 +363,13 @@ def orthogonalize(X: torch.Tensor, coeffs: list,
 
 # -----------------------------------------------------------------------------
 # Randomized low-rank projection (Halko-Martinsson-Tropp 2011).
-# Runs in eager mode because torch.linalg.qr graph-breaks fullgraph=True.
+# The Gaussian projector + NS + lift is compiled end-to-end (fullgraph=True) using a
+# regularized CholeskyQR. Householder QR (_qr_reduced) is kept for the Kaczmarz
+# projector and as an eager baseline (RANDOMIZED_QR=householder).
+
+RANDOMIZED_QR = os.environ.get("RANDOMIZED_QR", "cholesky")
+CHOLQR_SHIFT = float(os.environ.get("CHOLQR_SHIFT", "1e-6"))
+CHOLQR_PASSES = int(os.environ.get("CHOLQR_PASSES", "2"))
 
 def _qr_reduced(Y: torch.Tensor) -> torch.Tensor:
     """Reduced QR in FP32 (batched-safe), cast back to Y's dtype."""
@@ -371,8 +377,30 @@ def _qr_reduced(Y: torch.Tensor) -> torch.Tensor:
     return Q.to(Y.dtype)
 
 
-@torch.no_grad()
-def randomized_project(M: torch.Tensor, k: int, p: int, h: int):
+def _cholesky_qr(Y: torch.Tensor, shift: float = CHOLQR_SHIFT,
+                 passes: int = CHOLQR_PASSES) -> torch.Tensor:
+    """Shifted CholeskyQR for tall-skinny Y (..., m, r), r << m. Compile-friendly.
+
+        G = Y^T Y + s*I,  L = chol(G),  Q = Y L^{-T}
+
+    All in FP32. The shift s = shift * mean(diag(G)) is relative so it is invariant to
+    the (unnormalized) scale of Y, and keeps G positive definite when power
+    iterations make Y numerically rank-deficient. cholesky_ex is used instead of
+    cholesky because the latter checks `info` on the host (sync + graph break).
+    passes=2 (CholeskyQR2) re-orthogonalizes Q, recovering ||Q^T Q - I|| ~ O(u).
+    """
+    Q = Y.float()
+    r = Q.size(-1)
+    eye = torch.eye(r, device=Q.device, dtype=Q.dtype)
+    for _ in range(passes):
+        G = Q.mT @ Q
+        s = shift * G.diagonal(dim1=-2, dim2=-1).mean(dim=-1)[..., None, None] + 1e-30
+        L, _ = torch.linalg.cholesky_ex(G + s * eye)
+        Q = torch.linalg.solve_triangular(L, Q.mT, upper=False).mT
+    return Q.to(Y.dtype)
+
+
+def _randomized_project_impl(M: torch.Tensor, k: int, p: int, h: int, qr_fn):
     is_tall = M.size(-2) > M.size(-1)
     m, n = M.size(-2), M.size(-1)
     r = k + p
@@ -383,7 +411,7 @@ def randomized_project(M: torch.Tensor, k: int, p: int, h: int):
         Y = M @ Omega
         for _ in range(h):
             Y = M @ (M.mT @ Y)
-        Q = _qr_reduced(Y)                 # (..., m, r)
+        Q = qr_fn(Y)                       # (..., m, r)
         B_small = Q.mT @ M                 # (..., r, n)
         return Q, B_small, True
     else:
@@ -391,9 +419,21 @@ def randomized_project(M: torch.Tensor, k: int, p: int, h: int):
         Y = M.mT @ Omega
         for _ in range(h):
             Y = M.mT @ (M @ Y)
-        Q = _qr_reduced(Y)                 # (..., n, r)
+        Q = qr_fn(Y)                       # (..., n, r)
         B_small = M @ Q                    # (..., m, r)
         return Q, B_small, False
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+@torch.no_grad()
+def randomized_project(M: torch.Tensor, k: int, p: int, h: int):
+    return _randomized_project_impl(M, k, p, h, _cholesky_qr)
+
+
+@torch.no_grad()
+def randomized_project_householder(M: torch.Tensor, k: int, p: int, h: int):
+    """Original eager path (graph break at torch.linalg.qr)."""
+    return _randomized_project_impl(M, k, p, h, _qr_reduced)
 
 
 @torch.no_grad()
@@ -463,30 +503,43 @@ def randomized_project_kaczmarz(M: torch.Tensor, k: int, p: int, h: int):
 
 
 PROJECTOR_REGISTRY = {
-    "gaussian": randomized_project,
+    "gaussian": randomized_project_householder,
     "kaczmarz": randomized_project_kaczmarz,
 }
 
 
-def orthogonalize_lowrank(M_bf16: torch.Tensor, k: int, p: int, h: int,
-                          coeffs: list, projector: str = "gaussian") -> torch.Tensor:
-    """Randomized low-rank orthogonalization:
-        project(M) -> (Q, B_small)            [Halko Gaussian or Kaczmarz importance sketch]
-        B_orth = orthogonalize(B_small, coeffs)
-        lift: Q @ B_orth  (tall)  or  B_orth @ Q^T  (wide)
-
-    The NS iteration runs on the small (k+p)-dim side, not the full m x n matrix.
-    """
-    project_fn = PROJECTOR_REGISTRY.get(projector)
-    if project_fn is None:
-        raise ValueError(f"Unknown projector {projector!r}. Options: {list(PROJECTOR_REGISTRY)}")
-    Q, B_small, is_tall = project_fn(M_bf16, k, p, h)
+def _lift(Q: torch.Tensor, B_small: torch.Tensor, is_tall: bool, coeffs: list) -> torch.Tensor:
     # B_small is small on one side; no need to split baddbmm
     B_orth = orthogonalize(B_small, coeffs, split_baddbmm=False)
     if is_tall:
         return Q @ B_orth
     else:
         return B_orth @ Q.mT
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def orthogonalize_lowrank(M_bf16: torch.Tensor, k: int, p: int, h: int,
+                          coeffs: list) -> torch.Tensor:
+    """Randomized low-rank orthogonalization (Gaussian sketch, CholeskyQR), one graph:
+        project(M) -> (Q, B_small)
+        B_orth = orthogonalize(B_small, coeffs)
+        lift: Q @ B_orth  (tall)  or  B_orth @ Q^T  (wide)
+
+    The NS iteration runs on the small (k+p)-dim side, not the full m x n matrix.
+    """
+    Q, B_small, is_tall = randomized_project(M_bf16, k, p, h)
+    return _lift(Q, B_small, is_tall, coeffs)
+
+
+def orthogonalize_lowrank_eager(M_bf16: torch.Tensor, k: int, p: int, h: int,
+                                coeffs: list, projector: str = "gaussian") -> torch.Tensor:
+    """Eager variant with Householder QR: Kaczmarz projector, or the Gaussian
+    baseline when RANDOMIZED_QR=householder."""
+    project_fn = PROJECTOR_REGISTRY.get(projector)
+    if project_fn is None:
+        raise ValueError(f"Unknown projector {projector!r}. Options: {list(PROJECTOR_REGISTRY)}")
+    Q, B_small, is_tall = project_fn(M_bf16, k, p, h)
+    return _lift(Q, B_small, is_tall, coeffs)
 
 # -----------------------------------------------------------------------------
 # Sparse Comms for bigram embedding gradient reduce-scatter
@@ -1293,11 +1346,18 @@ class NorMuonAndAdam:
         # 2. Orthogonalize (full NS, or with randomized low-rank projection)
         is_large_matrix = chunk_shape[-2] > 1024
         if p_cfg.use_randomized:
-            v_chunk = orthogonalize_lowrank(
-                M_bf16,
-                k=p_cfg.k, p=p_cfg.oversampling, h=p_cfg.power_iter,
-                coeffs=p_cfg.coeffs, projector=p_cfg.projector,
-            )
+            if p_cfg.projector == "gaussian" and RANDOMIZED_QR == "cholesky":
+                v_chunk = orthogonalize_lowrank(
+                    M_bf16,
+                    k=p_cfg.k, p=p_cfg.oversampling, h=p_cfg.power_iter,
+                    coeffs=p_cfg.coeffs,
+                )
+            else:
+                v_chunk = orthogonalize_lowrank_eager(
+                    M_bf16,
+                    k=p_cfg.k, p=p_cfg.oversampling, h=p_cfg.power_iter,
+                    coeffs=p_cfg.coeffs, projector=p_cfg.projector,
+                )
         else:
             v_chunk = orthogonalize(
                 M_bf16, coeffs=p_cfg.coeffs, split_baddbmm=is_large_matrix,
