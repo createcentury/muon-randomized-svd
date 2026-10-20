@@ -11,13 +11,13 @@ CholeskyQR. All numbers below were measured on branch `cholesky-qr`
 ### 1.1 Inexact polar condition (Assumption 2.1)
 
 The convergence analysis allows the exact polar factor to be replaced by an inexact operator
-$\mathcal{T}$, provided there exist $\gamma_k \in [0,1)$ and $\nu_k \ge 0$ such that
+$\mathcal{T}$, provided there exist $`\gamma_k \in [0,1)`$ and $`\nu_k \ge 0`$ such that
 
-$$
+```math
 \mathbb{E}\left[\langle M_k, \mathcal{T}(M_k)\rangle \mid M_k\right] \ge (1-\gamma_k)\,\|M_k\|_*,
 \qquad
 \mathbb{E}\left[\|\mathcal{T}(M_k)\|_{\mathrm{op}}^2 \mid M_k\right] \le (1+\nu_k)^2 .
-$$
+```
 
 ### 1.2 Randomized lifted polar factor (Algorithm 1, Proposition 2.3)
 
@@ -27,24 +27,24 @@ and proceeds in five steps:
 1. Form $Y = (MM^\top)^h M\Omega$.
 2. Orthonormalize: $Q = \mathrm{orth}(Y)$.
 3. Compress: $B = Q^\top M$.
-4. Run $q$ Newton–Schulz steps from $Z_0 = B/\delta$.
-5. Lift back: return $\mathcal{T}_{h,q}(M;\Omega) = Q Z_q$.
+4. Run $q$ Newton–Schulz steps from $`Z_0 = B/\delta`$.
+5. Lift back: return $`\mathcal{T}_{h,q}(M;\Omega) = Q Z_q`$.
 
-For any $\delta \ge \|M\|_{\mathrm{op}}$, Proposition 2.3 gives
+For any $`\delta \ge \|M\|_{\mathrm{op}}`$, Proposition 2.3 gives
 
-$$
+```math
 \mathbb{E}_\Omega\left[\langle M, \mathcal{T}_{h,q}(M;\Omega)\rangle\right] \ge
 \frac{1}{\delta}\left[\sum_{j=1}^{s}\sigma_j^2 - \frac{s}{p-1}\,\varrho_s^{4h}\sum_{j>s}\sigma_j^2\right]_+,
 \qquad \varrho_s = \sigma_{s+1}/\sigma_s,
-$$
+```
 
-and $\|\mathcal{T}_{h,q}(M;\Omega)\|_{\mathrm{op}} \le 1$ almost surely.
+and $`\|\mathcal{T}_{h,q}(M;\Omega)\|_{\mathrm{op}} \le 1`$ almost surely.
 
 The operator-norm bound uses the fact that $Q$ has orthonormal columns:
-$\|QZ_q\|_{\mathrm{op}} \le \|Q\|_{\mathrm{op}}\|Z_q\|_{\mathrm{op}}$. Any replacement for
+$`\|QZ_q\|_{\mathrm{op}} \le \|Q\|_{\mathrm{op}}\|Z_q\|_{\mathrm{op}}`$. Any replacement for
 `orth` therefore has to (i) span the same subspace as $Y$ and (ii) produce columns that are
-orthonormal to working precision. If $\|Q^\top Q - I\|_2 = \epsilon$, then
-$\|Q\|_{\mathrm{op}} \le \sqrt{1+\epsilon}$, and the bound becomes $\|\mathcal{T}\|_{\mathrm{op}} \le \sqrt{1+\epsilon}$.
+orthonormal to working precision. If $`\|Q^\top Q - I\|_2 = \epsilon`$, then
+$`\|Q\|_{\mathrm{op}} \le \sqrt{1+\epsilon}`$, and the bound becomes $`\|\mathcal{T}\|_{\mathrm{op}} \le \sqrt{1+\epsilon}`$.
 
 In the repository, $s$ = `--rank`, $p$ = `--oversampling`, $h$ = `--power-iters`, and
 $q$ = `--orth-steps`. All experiments here use $s=200$, $p=10$ ($\ell = 210$), $h=1$, $q=7$,
@@ -136,12 +136,12 @@ $Y$, default linalg backend (cuSOLVER). The script measures three things:
 `_cholesky_qr` in `nanogpt/train_gpt.py` replaces the Householder QR in the Gaussian projector.
 Each of three passes does the following, in FP32:
 
-$$
+```math
 Q \leftarrow Q D^{-1}\ (\text{column scaling}),\quad
 G = Q^\top Q + sI,\quad
 L = \mathrm{chol}(G),\quad
 Q \leftarrow Q\,(L^{-1})^\top .
-$$
+```
 
 - **Column scaling.** Each column is normalized before the Gram product. This leaves
   $\mathrm{span}(Q)$ unchanged, makes the shift scale-invariant, and prevents FP32 overflow
@@ -167,7 +167,7 @@ Two paths still use the original eager Householder implementation: the Kaczmarz 
 and runs with `RANDOMIZED_QR=householder` (kept as a baseline).
 
 A single shifted pass followed by only one CholeskyQR pass reached a worst-case
-$\|Q^\top Q - I\|_F$ of $1.8\times10^{-4}$. We use three passes because that brings the error
+$`\|Q^\top Q - I\|_F`$ of $1.8\times10^{-4}$. We use three passes because that brings the error
 below $10^{-4}$.
 
 ## 4. Numerical validation
@@ -176,22 +176,22 @@ below $10^{-4}$.
 the same sketch $\Omega$, and the test covers 18 cases:
 
 - **Shapes:** (768, 768), (3072, 768), (768, 3072), and batched (4, 3072, 768) and (4, 768, 768).
-- **Spectra:** power-law, $\sigma_i = i^{-d}$ with $d \in \{0.5, 1, 2, 3\}$.
-- **Power iterations:** $h \in \{0, 1, 2\}$.
+- **Spectra:** power-law, $`\sigma_i = i^{-d}`$ with $`d \in \{0.5, 1, 2, 3\}`$.
+- **Power iterations:** $`h \in \{0, 1, 2\}`$.
 - **Condition numbers:** $\kappa(Y)$ up to about $5\times10^6$.
 
 **Results** (A100, torch 2.7.1, maxima over all 18 cases):
 
 | Quantity | Result | Criterion |
 | :--- | :--- | :--- |
-| $\lVert Q^\top Q - I\rVert_F$, CholeskyQR3, FP32 factor | $1.2\times10^{-5}$ | $\le 10^{-4}$ |
-| $\lVert Q^\top Q - I\rVert_F$, bf16 output (Householder / CholeskyQR3) | $2.3\times10^{-2}$ / $2.3\times10^{-2}$ | CholeskyQR3 $\le 1.5\times$ Householder |
-| Relative difference of $\langle M, QZ_q\rangle/\lVert M\rVert_*$ vs. Householder ($Z_q$ = exact polar factor and 5-step NS) | $6.5\times10^{-6}$ | $\le 10^{-2}$ |
+| $`\lVert Q^\top Q - I\rVert_F`$, CholeskyQR3, FP32 factor | $1.2\times10^{-5}$ | $\le 10^{-4}$ |
+| $`\lVert Q^\top Q - I\rVert_F`$, bf16 output (Householder / CholeskyQR3) | $2.3\times10^{-2}$ / $2.3\times10^{-2}$ | CholeskyQR3 $\le 1.5\times$ Householder |
+| Relative difference of $`\langle M, QZ_q\rangle/\lVert M\rVert_*`$ vs. Householder ($`Z_q`$ = exact polar factor and 5-step NS) | $6.5\times10^{-6}$ | $\le 10^{-2}$ |
 | Degenerate inputs (zero matrix, exactly rank-deficient $Y$) | finite output | finite |
 
 The orthogonality of the bf16 $Q$ consumed by the optimizer is limited by bf16 rounding,
 which is about $10^{-2}$. This limit applies equally to the original Householder path, so
-CholeskyQR3 does not loosen the effective $(1+\nu_k)$ bound relative to the original
+CholeskyQR3 does not loosen the effective $`(1+\nu_k)`$ bound relative to the original
 implementation.
 
 The alignment check is a comparison against the original implementation, not a direct
@@ -302,7 +302,7 @@ done
 | Variable | Default | Meaning |
 | :--- | :--- | :--- |
 | `RANDOMIZED_QR` | `cholesky` | `cholesky`: compiled CholeskyQR3 path. `householder`: original eager path. |
-| `CHOLQR_SHIFT` | `1e-6` | Relative shift for pass 1 ($s = \text{shift}\cdot\mathrm{tr}(G)$). |
+| `CHOLQR_SHIFT` | `1e-6` | Relative shift for pass 1 ($`s = \text{shift}\cdot\mathrm{tr}(G)`$). |
 | `CHOLQR_PASSES` | `3` | Total number of CholeskyQR passes. |
 
 **Software environment:** A100-SXM4-40GB (Google Colab), driver 580.82, Python 3.13,
